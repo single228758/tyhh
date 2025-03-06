@@ -12,12 +12,13 @@ from io import BytesIO
 import threading
 import uuid
 from urllib.parse import unquote
+import numpy as np
 
 @register(
     name="TYHH",
     desc="通义绘画插件",
     version="1.2",
-    author="八戒",
+    author="your_name",
 )
 class TongyiDrawingPlugin(Plugin):
     def __init__(self):
@@ -287,6 +288,13 @@ class TongyiDrawingPlugin(Plugin):
                         e_context.action = EventAction.BREAK_PASS
                         return
                         
+                    # 预处理图片
+                    processed_image_path = self._preprocess_sketch_image(image_path)
+                    if not processed_image_path:
+                        e_context["reply"] = Reply(ReplyType.TEXT, "图片处理失败，请重试")
+                        e_context.action = EventAction.BREAK_PASS
+                        return
+                    
                     user_data = self.sketch_waiting_users[user_id]
                     prompt = user_data["prompt"]
                     resolution = user_data["resolution"]
@@ -296,11 +304,17 @@ class TongyiDrawingPlugin(Plugin):
                     wait_reply = Reply(ReplyType.TEXT, "正在处理您的手绘作品，请稍候......")
                     e_context["channel"].send(wait_reply, e_context["context"])
                     
-                    # 上传图片到OSS
-                    oss_url = self._upload_image_to_oss(image_path, "sketch_to_image")
+                    # 上传处理后的图片到OSS
+                    oss_url = self._upload_image_to_oss(processed_image_path, "sketch_to_image")
                     if not oss_url:
                         raise Exception("图片上传失败")
                         
+                    # 清理临时文件
+                    try:
+                        os.remove(processed_image_path)
+                    except:
+                        pass
+                    
                     # 提交任务
                     task_id = self._send_image_gen_request(
                         self._get_headers(),
@@ -1290,204 +1304,174 @@ class TongyiDrawingPlugin(Plugin):
 
     def _send_image_gen_request(self, headers, prompt, resolution="1024*1024", task_type="text_to_image_v2", base_image=None, style=None):
         """发送图片生成请求"""
-        url = 'https://wanxiang.aliyun.com/wanx/api/common/imageGen'
-        
-        # 构建任务数据
-        task_data = {
-            "taskType": task_type,
-            "taskInput": {
-                "prompt": prompt,
-                "resolution": resolution
-            }
-        }
-        
-        # 如果是手绘或上传模式，添加相关参数
-        if task_type in ["sketch_to_image", "text_to_image_v2"] and base_image:
-            task_data["taskInput"]["baseImage"] = base_image
-            if task_type == "sketch_to_image" and style:
-                task_data["taskInput"]["style"] = style
-        
-        # 确保头部包含所有必要信息
-        if 'x-xsrf-token' not in headers and self.xsrf_token:
-            headers['x-xsrf-token'] = self.xsrf_token
-            
-        # 添加其他必要的头部信息
-        additional_headers = {
-            'sec-ch-ua': '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-site',
-            'Content-Type': 'application/json'
-        }
-        
-        # 将额外的头部添加到请求头中
-        headers.update(additional_headers)
-        
-        # 添加重试机制
         max_retries = 3
-        retry_delay = 2  # 重试等待时间（秒）
+        current_retry = 0
         
-        for attempt in range(max_retries):
+        while current_retry < max_retries:
             try:
-                logger.info(f"[TYHH] 发送图片生成请求: {url} (尝试 {attempt + 1}/{max_retries})")
-                logger.debug(f"[TYHH] Headers: {headers}")
-                logger.debug(f"[TYHH] Data: {task_data}")
+                url = "https://wanxiang.aliyun.com/wanx/api/common/imageGen"
                 
-                session = requests.Session()
-                response = session.post(url, headers=headers, json=task_data, timeout=30)
+                # 更新headers
+                headers.update({
+                    "x-platform": "web",
+                    "x-xsrf-token": self._get_xsrf_token(),
+                    "content-type": "application/json",
+                    "accept": "application/json, text/plain, */*",
+                    "accept-language": "zh-CN,zh;q=0.9",
+                    "origin": "https://tongyi.aliyun.com",
+                    "referer": "https://tongyi.aliyun.com/wanxiang/app/doodle",
+                    "sec-ch-ua": '"Google Chrome";v="129", "Not=A?Brand";v="8", "Chromium";v="129"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-site"
+                })
                 
-                logger.info(f"[TYHH] 图片生成响应状态码: {response.status_code}")
-                logger.debug(f"[TYHH] 响应内容: {response.text}")
+                task_input = {
+                    "prompt": prompt,
+                    "resolution": resolution
+                }
                 
-                if response.status_code == 200:
-                    response_data = response.json()
-                    if response_data.get("success"):
-                        return response_data.get("data")
-                    else:
-                        error_message = response_data.get("errorMsg", "")
-                        logger.error(f"[TYHH] API错误: {error_message}")
-                        
-                        # 检查是否是登录凭证相关错误
-                        if any(keyword in error_message.lower() for keyword in ["登录", "凭证", "认证", "token"]):
-                            logger.error("[TYHH] 检测到登录凭证相关错误，标记需要登录")
-                            self.need_login = True
-                            break
-                elif response.status_code in [401, 403]:
-                    logger.error(f"[TYHH] 认证失败，状态码: {response.status_code}")
-                    self.need_login = True
-                    break
-                else:
-                    logger.error(f"[TYHH] 请求失败，状态码: {response.status_code}")
-                
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                    continue
+                if style:
+                    task_input["style"] = style
+                    task_input["styleName"] = self._get_style_name(style)
                     
-            except requests.exceptions.RequestException as e:
-                logger.error(f"[TYHH] 请求异常: {str(e)}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                    continue
-            except Exception as e:
-                logger.error(f"[TYHH] 发送图片生成请求失败: {str(e)}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                    continue
-            finally:
-                if 'session' in locals():
-                    session.close()
+                if base_image:
+                    task_input["baseImage"] = base_image
+                    
+                payload = {
+                    "taskType": task_type,
+                    "taskInput": task_input
+                }
                 
-        return None
-
-    def _get_task_result(self, headers, task_id, original_params=None):
-        """获取任务结果"""
-        logger.info(f"[TYHH] 开始查询任务结果: {task_id}")
-        result_url = 'https://wanxiang.aliyun.com/wanx/api/common/taskResult'
-        max_retries = 10  # 最大重试次数
-        retry_count = 0
-        retry_delay = 10  # 重试等待时间（秒）
-        zero_progress_count = 0  # 记录连续0%进度的次数
-        resend_attempts = 0  # 重新发送请求的次数
-        
-        while retry_count < max_retries:
-            retry_count += 1
-            logger.info(f"[TYHH] 尝试查询任务 {task_id}，第 {retry_count} 次")
-            
-            try:
-                response = requests.post(
-                    result_url,
-                    headers=headers,
-                    json={"taskId": task_id}
-                )
+                logger.info(f"[TYHH] 发送请求到 {url}")
+                logger.info(f"[TYHH] Headers: {headers}")
+                logger.info(f"[TYHH] Payload: {payload}")
                 
-                logger.info(f"[TYHH] 任务查询响应状态码: {response.status_code}")
-                logger.debug(f"[TYHH] 响应内容: {response.text}")
+                response = requests.post(url, headers=headers, json=payload, timeout=30)
+                logger.info(f"[TYHH] 图片生成响应状态码: {response.status_code}")
+                logger.info(f"[TYHH] 响应内容: {response.text[:200]}")
                 
                 if response.status_code == 200:
                     result = response.json()
-                    if not result.get('success'):
-                        logger.error(f"[TYHH] 查询失败: {result.get('errorMsg', '未知错误')}")
-                        time.sleep(retry_delay)
-                        continue
-                        
-                    task_data = result.get('data', {})
-                    status = task_data.get('taskRate', 0)
-                    
-                    logger.info(f"[TYHH] 任务进度: {status}%")
-                    
-                    # 任务完成
-                    if status == 100:
-                        logger.info(f"[TYHH] 任务 {task_id} 已完成")
-                        return task_data.get('taskResult', [])
-                    # 检查是否连续两次0%进度
-                    elif status == 0:
-                        zero_progress_count += 1
-                        logger.info(f"[TYHH] 连续 {zero_progress_count} 次进度为0%")
-                        
-                        if zero_progress_count >= 2 and original_params and resend_attempts < 3:
-                            # 重新发送请求
-                            resend_attempts += 1
-                            logger.info(f"[TYHH] 尝试重新发送请求 (第 {resend_attempts} 次)")
-                            
-                            # 解包原始参数
-                            prompt = original_params.get('prompt', '')
-                            resolution = original_params.get('resolution', '1024*1024')
-                            task_type = original_params.get('task_type', 'text_to_image_v2')
-                            base_image = original_params.get('base_image')
-                            style = original_params.get('style')
-                            
-                            # 重新发送请求
-                            new_task_id = self._send_image_gen_request(
-                                headers,
-                                prompt,
-                                resolution,
-                                task_type,
-                                base_image,
-                                style
-                            )
-                            
-                            if new_task_id:
-                                logger.info(f"[TYHH] 成功创建新任务: {new_task_id}")
-                                # 递归调用，但传入相同的original_params
-                                return self._get_task_result(headers, new_task_id, original_params)
-                            else:
-                                logger.error("[TYHH] 重新发送请求失败")
-                                
-                        time.sleep(retry_delay)
-                        continue
+                    if result.get("success"):
+                        task_id = result.get("data")
+                        logger.info(f"[TYHH] 成功创建新任务: {task_id}")
+                        return task_id
                     else:
-                        # 如果进度不为0%，重置计数器
-                        zero_progress_count = 0
-                        logger.info(f"[TYHH] 任务 {task_id} 进行中，等待 {retry_delay} 秒后重试")
-                        time.sleep(retry_delay)
-                        continue
-                        
-                else:
-                    logger.error(f"[TYHH] 查询任务状态失败: {response.status_code}")
-                    time.sleep(retry_delay)
-                    continue
+                        error_msg = result.get("errorMsg", "未知错误")
+                        if "人数较多" in error_msg or "请稍后再试" in error_msg:
+                            logger.warning(f"[TYHH] 服务繁忙: {error_msg}")
+                            time.sleep(5)
+                            current_retry += 1
+                            continue
+                        else:
+                            logger.error(f"[TYHH] 创建任务失败: {error_msg}")
+                            return None
+                
+                current_retry += 1
+                time.sleep(3)
+                
+            except Exception as e:
+                logger.error(f"[TYHH] 发送请求出错: {str(e)}")
+                current_retry += 1
+                time.sleep(3)
+                
+        return None
+
+    def _get_xsrf_token(self):
+        """获取新的XSRF token"""
+        cookie = self.config.get("cookie", "")
+        for item in cookie.split(";"):
+            item = item.strip()
+            if item.startswith("XSRF-TOKEN="):
+                return item.split("=")[1].strip()
+        return ""
+
+    def _get_style_name(self, style):
+        """获取风格名称"""
+        style_map = {
+            "<flat illustration>": "扁平插画",
+            "<oil painting>": "油画",
+            "<anime>": "二次元",
+            "<watercolor>": "水彩",
+            "<3d cartoon>": "3D卡通"
+        }
+        return style_map.get(style, "")
+
+    def _get_task_result(self, headers, task_id, original_params=None):
+        """获取任务结果"""
+        max_retries = 30  # 最大重试次数
+        retry_count = 0
+        interval = 10  # 轮询间隔
+        zero_progress_count = 0  # 连续0%进度计数
+        
+        while retry_count < max_retries:
+            try:
+                url = "https://wanxiang.aliyun.com/wanx/api/common/taskResult"
+                payload = {
+                    "taskId": task_id,
+                    "id": original_params.get("id") if original_params else None
+                }
+                
+                response = requests.post(url, headers=headers, json=payload)
+                if response.status_code != 200:
+                    logger.error(f"[TYHH] 任务查询失败,状态码: {response.status_code}")
+                    return None
                     
+                result = response.json()
+                if not result.get("success"):
+                    logger.error(f"[TYHH] 任务查询响应错误: {result}")
+                    return None
+                    
+                task_data = result.get("data", {})
+                progress = task_data.get("taskRate", 0)
+                status = task_data.get("status")
+                
+                logger.info(f"[TYHH] 任务进度: {progress}%")
+                
+                # 检查任务状态
+                if progress == 100 or status == 2:  # 成功完成
+                    return task_data.get("taskResult", [])
+                elif status == 3:  # 失败
+                    logger.error(f"[TYHH] 任务失败: {result}")
+                    return None
+                    
+                # 检查连续0%进度
+                if progress == 0:
+                    zero_progress_count += 1
+                    if zero_progress_count >= 2:  # 连续两次0%进度
+                        logger.warning("[TYHH] 连续两次0%进度，任务可能被拒绝")
+                        return None
+                else:
+                    zero_progress_count = 0  # 重置计数器
+                    
+                retry_count += 1
+                time.sleep(interval)
+                
             except Exception as e:
                 logger.error(f"[TYHH] 查询任务出错: {str(e)}")
-                if retry_count < max_retries:
-                    time.sleep(retry_delay)
-                    continue
-                break
-            
-        logger.error(f"[TYHH] 达到最大重试次数，任务 {task_id} 查询失败")
+                retry_count += 1
+                if retry_count >= max_retries:
+                    return None
+                time.sleep(interval)
+                
+        logger.error("[TYHH] 任务超时")
         return None
 
     def _extract_high_quality_image_urls(self, task_result):
         """提取高质量图片URL"""
         try:
             high_quality_urls = []
-            logger.info(f"[TYHH] 开始提取图片URL，任务结果包含 {len(task_result)} 个图片")
+            if not task_result:
+                return high_quality_urls
+            
+            logger.info(f"[TYHH] 开始提取图片URL")
             
             for index, result in enumerate(task_result):
                 # 使用downloadUrl获取无水印原图
-                download_url = result.get("downloadUrl")
+                download_url = result.get("downloadUrl", "").split("?")[0]  # 去除URL参数
                 if download_url:
                     high_quality_urls.append(download_url)
                     logger.info(f"[TYHH] 成功提取第 {index+1} 张图片的URL: {download_url[:50]}...")
@@ -1686,13 +1670,11 @@ class TongyiDrawingPlugin(Plugin):
             "-彩绘": "<watercolor>"  # 添加彩绘风格映射
         }
         
-        # 比例映射
+        # 比例映射 - 只保留支持的比例
         ratio_mapping = {
             "-1:1": "1024*1024",
             "-16:9": "1280*720",
-            "-9:16": "720*1280",
-            "-4:3": "1152*864",
-            "-3:4": "864*1152"
+            "-9:16": "720*1280"
         }
 
         # 先找出所有参数的位置
@@ -1721,3 +1703,52 @@ class TongyiDrawingPlugin(Plugin):
         
         logger.info(f"[TYHH] 解析命令结果: prompt='{prompt}', resolution='{resolution}', style='{style}'")
         return prompt, resolution, style
+
+    def _preprocess_sketch_image(self, image_path):
+        """
+        预处理涂鸦图片，将白底彩色线条转换为黑底白线
+        """
+        try:
+            from PIL import Image
+            import numpy as np
+            
+            # 打开图片
+            img = Image.open(image_path)
+            
+            # 转换为RGBA格式（如果不是的话）
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+                
+            # 转换为numpy数组以便处理
+            data = np.array(img)
+            
+            # 创建一个新的全黑图像
+            new_data = np.zeros_like(data)
+            
+            # 获取alpha通道
+            alpha = data[:, :, 3]
+            
+            # 计算RGB通道的平均值（用于检测非白色区域）
+            rgb_mean = data[:, :, :3].mean(axis=2)
+            
+            # 创建掩码：
+            # 1. alpha > 0 表示非透明区域
+            # 2. rgb_mean < 240 表示非白色区域（允许一些容差）
+            mask = (alpha > 0) & (rgb_mean < 240)
+            
+            # 将掩码区域设置为白色，其他区域保持黑色
+            new_data[mask] = [255, 255, 255, 255]  # 白色，完全不透明
+            new_data[~mask] = [0, 0, 0, 255]  # 黑色，完全不透明
+            
+            # 创建新图像
+            processed_img = Image.fromarray(new_data)
+            
+            # 保存处理后的图片
+            temp_dir = os.path.dirname(image_path)
+            processed_path = os.path.join(temp_dir, f"processed_{os.path.basename(image_path)}")
+            processed_img.save(processed_path, 'PNG')
+            
+            return processed_path
+        except Exception as e:
+            logger.error(f"[TYHH] 处理涂鸦图片失败: {e}")
+            return None
